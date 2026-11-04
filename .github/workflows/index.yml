@@ -1,0 +1,70 @@
+name: Índice de títulos
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Publicar aunque no haya cambios"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: index
+  cancel-in-progress: false
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Pruebas del generador
+        run: node scripts/test.mjs
+
+      - name: Traer el índice anterior (rama data)
+        run: |
+          set +e
+          git ls-remote --exit-code --heads origin data > /dev/null 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            git fetch --depth 1 origin data
+            git worktree add --detach prev FETCH_HEAD
+            test -f prev/index.json
+          elif [ "$rc" -eq 2 ]; then
+            mkdir -p prev
+          else
+            echo "no se pudo consultar la rama data (error de red)"; exit 1
+          fi
+
+      - name: Generar
+        id: gen
+        env:
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+        run: node scripts/gen-index.mjs --out dist --prev prev --hours 5 ${{ inputs.force && '--force' || '' }}
+
+      - name: Verificar
+        if: steps.gen.outputs.changed == 'true'
+        run: node scripts/check-index.mjs dist
+
+      - name: Publicar en la rama data (un solo commit)
+        if: steps.gen.outputs.changed == 'true'
+        run: |
+          cp data-README.md dist/README.md
+          cd dist
+          git init -q -b data
+          git config user.name "xuper-plugin"
+          git config user.email "335105665+xuper-plugin@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Índice $(date -u +%Y-%m-%d)"
+          git push --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data

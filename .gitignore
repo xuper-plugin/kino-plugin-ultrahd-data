@@ -1,0 +1,6 @@
+node_modules/
+dist/
+prev/
+*.log
+.env
+*.done

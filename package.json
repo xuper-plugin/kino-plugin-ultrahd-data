@@ -1,0 +1,11 @@
+{
+  "name": "kino-plugin-ultrahd-data",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "gen": "node scripts/gen-index.mjs --out dist --prev prev",
+    "check": "node scripts/check-index.mjs dist",
+    "test": "node scripts/test.mjs"
+  }
+}
