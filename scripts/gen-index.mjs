@@ -11,7 +11,7 @@ import { isAdultName } from "../lib/names.js";
 import { isHidden } from "../lib/categoryRules.js";
 
 export const FORMAT = 1;
-export const PART_LIMIT = 400000; // bytes por trozo sin comprimir (Kino recomienda valores de ≤ 512 KB en memoria)
+export const PART_LIMIT = 100000; // bytes por trozo sin comprimir: trozos chicos para que un TV lento los parsee y vuelque sin atascarse
 export const MAX_TITLE = 300; // kino.catalog: maxTitleChars
 export const MIN_COVERAGE = 0.9;
 const PREV_URL = "https://raw.githubusercontent.com/xuper-plugin/kino-plugin-ultrahd-data/data/";
