@@ -3,7 +3,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { findKey, sha1, PART_LIMIT, MIN_COVERAGE, FORMAT } from "./gen-index.mjs";
+import { findKey, sha1, idOf, revisionOf, PART_LIMIT, MIN_COVERAGE, MAX_TITLE, FORMAT, DELTAS_KEPT } from "./gen-index.mjs";
 
 export function checkIndex(dir) {
   const problems = [];
@@ -16,8 +16,11 @@ export function checkIndex(dir) {
   if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(manifest.generated || "")) bad("generated inválido");
   if (!(manifest.coverage >= MIN_COVERAGE && manifest.coverage <= 1)) bad(`coverage fuera de [${MIN_COVERAGE}, 1]`);
   if (manifest.categories !== "categories.json") bad("categories debe ser categories.json");
+  if (!/^\d{8}T\d{6}Z$/.test(manifest.revision || "") || manifest.revision !== revisionOf(manifest.generated)) bad("revision debe ser generated sin guiones ni dos puntos");
+  if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(manifest.fullAt || "")) bad("fullAt inválido");
 
   const hashes = [];
+  const seen = new Set();
   let total = 0;
   for (const kind of ["movies", "series"]) {
     const m = manifest[kind];
@@ -36,11 +39,14 @@ export function checkIndex(dir) {
       let p;
       try { p = JSON.parse(text); } catch (e) { bad(`${file}: JSON inválido`); return; }
       const names = p.name === "" ? [] : String(p.name).split("\n");
-      const finds = p.find === "" ? [] : String(p.find).split("\n");
       const n = names.length;
-      if (finds.length !== n || p.year.length !== n || p.tmdb.length !== n || p.cats.length !== n) { bad(`${file}: listas paralelas desalineadas (${n}/${finds.length}/${p.year.length}/${p.tmdb.length}/${p.cats.length})`); return; }
+      if (p.find !== undefined) bad(`${file}: ya no lleva find (Kino normaliza el título)`);
+      if (p.year.length !== n || p.tmdb.length !== n || p.cats.length !== n) { bad(`${file}: listas paralelas desalineadas (${n}/${p.year.length}/${p.tmdb.length}/${p.cats.length})`); return; }
       for (let j = 0; j < n; j++) {
-        if (!names[j] || findKey(names[j]) !== finds[j]) { bad(`${file}[${j}]: find no corresponde al nombre`); break; }
+        if (!names[j] || names[j].length > MAX_TITLE) { bad(`${file}[${j}]: nombre vacío o de más de ${MAX_TITLE} caracteres`); break; }
+        const k = kind + ":" + findKey(names[j]) + "|" + p.year[j];
+        if (seen.has(k)) { bad(`${file}[${j}]: título repetido (${names[j].slice(0, 40)})`); break; }
+        seen.add(k);
         if (!Number.isInteger(p.year[j]) || p.year[j] < 0 || p.year[j] > 2100) { bad(`${file}[${j}]: año inválido`); break; }
         if (!Number.isInteger(p.tmdb[j]) || p.tmdb[j] < 0) { bad(`${file}[${j}]: tmdb inválido`); break; }
         if (!Array.isArray(p.cats[j]) || !p.cats[j].length || p.cats[j].some((c) => !Number.isInteger(c) || c <= 0)) { bad(`${file}[${j}]: categorías inválidas`); break; }
@@ -54,9 +60,35 @@ export function checkIndex(dir) {
 
   let cats;
   try { cats = read("categories.json"); JSON.parse(cats); hashes.push(sha1(cats)); } catch (_) { bad("categories.json inválido"); }
-  let miss = "";
-  try { miss = read("tmdb-cache.json"); JSON.parse(miss); hashes.push(sha1(miss)); } catch (_) { bad("tmdb-cache.json inválido"); }
   if (!problems.length && sha1(hashes.join("|")).slice(0, 16) !== manifest.hash) bad("hash del manifiesto no coincide");
+
+  // ---- deltas ----
+  const deltas = manifest.deltas;
+  if (!Array.isArray(deltas)) bad("deltas debe ser una lista");
+  else {
+    if (deltas.length > DELTAS_KEPT) bad(`más de ${DELTAS_KEPT} deltas`);
+    deltas.forEach((d, i) => {
+      const ok = /^\d{8}T\d{6}Z$/;
+      if (!d || !ok.test(d.from) || !ok.test(d.to) || d.file !== `delta-${d.from}-${d.to}.json`) { bad(`deltas[${i}]: forma inválida`); return; }
+      if (i > 0 && d.from !== deltas[i - 1].to) bad(`deltas[${i}]: la cadena no es consecutiva`);
+      let text;
+      try { text = read(d.file); } catch (_) { bad(`${d.file}: falta`); return; }
+      if (Buffer.byteLength(text) !== d.bytes) bad(`${d.file}: bytes no coinciden`);
+      let p;
+      try { p = JSON.parse(text); } catch (_) { bad(`${d.file}: JSON inválido`); return; }
+      if (p.from !== d.from || p.to !== d.to || !Array.isArray(p.added) || !Array.isArray(p.removed) || !Number.isInteger(p.total)) { bad(`${d.file}: contenido inválido`); return; }
+      if (p.added.length !== d.added || p.removed.length !== d.removed) bad(`${d.file}: conteos no coinciden`);
+      for (const e of p.added) {
+        if (!(e && (e.k === "m" || e.k === "s") && typeof e.n === "string" && e.n && e.n.length <= MAX_TITLE && Number.isInteger(e.y) && e.y >= 0 && Number.isInteger(e.t) && e.t >= 0 && Array.isArray(e.c) && e.c.length && e.c.every((c) => Number.isInteger(c) && c > 0))) { bad(`${d.file}: entrada inválida`); break; }
+      }
+      if (p.removed.some((id) => !/^[ms]-[a-z0-9]{2,26}$/.test(id))) bad(`${d.file}: id retirado inválido`);
+      for (const e of p.added.slice(0, 50)) if (!/^[ms]-[a-z0-9]{2,26}$/.test(idOf(e.k === "m" ? "movies" : "series", findKey(e.n), e.y))) bad("id calculado inválido");
+      if (i === deltas.length - 1) {
+        if (d.to !== manifest.revision) bad("el último delta debe terminar en la revisión actual");
+        if (p.total !== total) bad(`${d.file}: total ${p.total} no coincide con el índice (${total})`);
+      }
+    });
+  }
 
   for (const file of readdirSync(dir)) {
     const text = read(file);

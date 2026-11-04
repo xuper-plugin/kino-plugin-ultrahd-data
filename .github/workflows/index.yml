@@ -9,6 +9,10 @@ on:
         description: "Publicar aunque no haya cambios"
         type: boolean
         default: false
+      full:
+        description: "Hacer el barrido completo de categorías (por defecto: solo las calientes, y completo los domingos)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -20,7 +24,7 @@ concurrency:
 jobs:
   index:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -49,9 +53,7 @@ jobs:
 
       - name: Generar
         id: gen
-        env:
-          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
-        run: node scripts/gen-index.mjs --out dist --prev prev --hours 5 ${{ inputs.force && '--force' || '' }}
+        run: node scripts/gen-index.mjs --out dist --prev prev ${{ inputs.force && '--force' || '' }} ${{ inputs.full && '--full' || '' }}
 
       - name: Verificar
         if: steps.gen.outputs.changed == 'true'

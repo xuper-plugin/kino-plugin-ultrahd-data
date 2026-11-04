@@ -4,30 +4,34 @@
 
 ## Qué contiene el índice
 
-Por título: nombre limpio, forma normalizada para buscar (`find`: minúsculas, sin acentos ni signos), año, id de TMDB (si hay coincidencia segura) y las categorías en las que aparece. Nada más: ni ids de reproducción, ni servidores, ni credenciales, ni contenido para adultos (las categorías ocultas o 18+ de la tabla no se piden). Los ids reales se piden en vivo al abrir un resultado.
+Por título: nombre limpio, año y las categorías en las que aparece (más `tmdb`, reservado con 0). Nada más: ni ids de reproducción, ni servidores, ni credenciales, ni contenido para adultos (las categorías ocultas o 18+ de la tabla no se piden). Los ids reales se piden en vivo al abrir un resultado, y el id de TMDB lo resuelve el plugin solo para lo que muestra.
 
 Formato (versión 1), en la rama `data`:
 
 | Archivo | Contenido |
 | --- | --- |
-| `index.json` | `v`, `generated`, `coverage`, `hash`, `movies` y `series` con `count`, `parts`, `hashes` y `bytes` |
-| `movies-NN.json`, `series-NN.json` | `{ name, find, year, tmdb, cats }`: listas paralelas, un título por línea en `name` y `find`; ≤ 190 KB cada trozo |
+| `index.json` | `v`, `generated`, `revision`, `fullAt`, `coverage`, `hash`, `movies` y `series` (`count`, `parts`, `hashes`, `bytes`) y `deltas` |
+| `movies-NN.json`, `series-NN.json` | snapshot: `{ name, year, tmdb, cats }`, listas paralelas, un título por línea en `name`; ≤ 400 KB cada trozo |
+| `delta-<desde>-<hasta>.json` | `{ from, to, total, added: [{k, n, y, t, c}], removed: [ids] }`; los últimos 7 |
 | `categories.json` | la tabla de categorías (`vod`, `series`, `live`) |
-| `tmdb-cache.json` | títulos sin coincidencia y el día del último intento (uso interno) |
+
+La `revision` es `generated` sin guiones ni dos puntos. El id de un título es estable (`m-`/`s-` más un hash del nombre normalizado y el año), no depende del orden ni del trozo.
 
 ## Cómo se genera
 
 `scripts/gen-index.mjs` (Node ≥ 20, sin dependencias):
 
-1. Descarga el índice anterior de la rama `data` y lo usa de caché; si no puede, aborta sin publicar (no asume que estaba vacío).
-2. Pide el bootstrap, elige un servidor y recorre las categorías visibles, una petición a la vez, con 3 a 5 s entre categorías, reintentos con espera creciente (10, 30 y 90 s) y cambio de servidor tras fallos seguidos.
-3. Una categoría que falla se conserva del índice anterior. Si la cobertura baja de 90 %, no se publica. Si no cambió nada, tampoco.
-4. Con `TMDB_API_KEY`, busca el id de TMDB solo de los títulos nuevos (≈ 4 peticiones por segundo). Los que no coinciden no se reintentan hasta pasados 14 días y, como mucho, 500 por corrida.
-5. `scripts/check-index.mjs` valida el formato y que no haya credenciales ni urls antes de publicar.
+1. Descarga el índice anterior de la rama `data` y lo usa de base; si no puede, aborta sin publicar (no asume que estaba vacío).
+2. **Refresco escalonado.** A diario solo recorre las categorías que cambian (estrenos, `CINE`/`MOVIES` del año actual y el anterior, `NEW RELEASES` y las plataformas de series con más movimiento: ≈ 10 peticiones) sobre una copia del índice anterior, y detecta altas y bajas dentro de ellas. El barrido completo de todas las categorías (≈ 155 peticiones, unos 13 minutos) se hace los domingos, pasados 7 días del anterior, o con `--full`.
+3. Un título que ya estaba se copia tal cual (nombre incluido); solo se procesan los nuevos.
+4. Pide el bootstrap, elige un servidor y recorre las categorías de una en una, con 3 a 5 s entre peticiones, reintentos con espera creciente (10, 30 y 90 s) y cambio de servidor tras fallos seguidos. Una categoría que falla se conserva del índice anterior; si la cobertura baja de 90 %, no se publica; si no cambió nada, tampoco.
+5. Publica el snapshot completo y, además, el delta contra la revisión anterior (se conservan los últimos 7, encadenados).
+6. `scripts/check-index.mjs` valida formato, deltas encadenados y que no haya credenciales ni urls antes de publicar.
 
 ```bash
-node scripts/test.mjs                               # pruebas con servidores falsos
-node scripts/gen-index.mjs --out dist --prev prev   # genera (tarda unos 15 minutos sin TMDB)
+node scripts/test.mjs                               # pruebas con un servidor falso
+node scripts/gen-index.mjs --out dist --prev prev   # genera (parcial o completo según toque)
+node scripts/gen-index.mjs --out dist --prev prev --full
 node scripts/check-index.mjs dist
 ```
 
@@ -35,4 +39,4 @@ Para sincronizar las reglas con el plugin: `node scripts/sync-lib.mjs <carpeta d
 
 ## Workflow
 
-`.github/workflows/index.yml` corre a diario (07:17 UTC) y a mano. Secreto opcional: `TMDB_API_KEY`. Publica con un solo commit huérfano en la rama `data` (autor `xuper-plugin`), sobrescrito con `--force`.
+`.github/workflows/index.yml` corre a diario (07:17 UTC) y a mano (`force`, `full`). No necesita secretos. Publica con un solo commit huérfano en la rama `data` (autor `xuper-plugin`), sobrescrito con `--force`.

@@ -1,5 +1,5 @@
 // Genera el índice de títulos de Ultra Hd (películas y series) y lo escribe en --out.
-//   node scripts/gen-index.mjs --out dist --prev prev [--hours 4.5] [--force]
+//   node scripts/gen-index.mjs --out dist --prev prev [--full] [--force]
 // Respetuoso con el servidor: una petición a la vez, 3-5 s entre categorías, backoff ante errores. No escribe ni imprime
 // nunca credenciales, usuarios, hosts de servidores IPTV ni urls con ellos.
 import { createHash } from "node:crypto";
@@ -11,10 +11,9 @@ import { isAdultName } from "../lib/names.js";
 import { isHidden } from "../lib/categoryRules.js";
 
 export const FORMAT = 1;
-export const PART_LIMIT = 190000; // bytes por trozo sin comprimir: cabe en los 256 KB que escribe un job de Kino por ejecución
+export const PART_LIMIT = 400000; // bytes por trozo sin comprimir (Kino recomienda valores de ≤ 512 KB en memoria)
+export const MAX_TITLE = 300; // kino.catalog: maxTitleChars
 export const MIN_COVERAGE = 0.9;
-export const MISS_RETRY_DAYS = 14;
-export const MISS_RETRY_CAP = 500;
 const PREV_URL = "https://raw.githubusercontent.com/xuper-plugin/kino-plugin-ultrahd-data/data/";
 const BOOTSTRAP = "http://vegetatvv2.duckdns.org/bootstrap.php";
 const UA = "Mozilla/5.0 (compatible; VegetaTVCache/2.0)";
@@ -37,6 +36,7 @@ export function cleanTitle(raw, yearField) {
   }
   if (isYear(yearField)) year = Number(String(yearField).trim());
   name = name.replace(/\s+/g, " ").trim();
+  if (name.length > MAX_TITLE) name = name.slice(0, MAX_TITLE).replace(/[\uD800-\uDBFF]$/, "").trim();
   return { name, year };
 }
 
@@ -88,7 +88,6 @@ const vegetaHeaders = (code) => ({
 
 export const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 export const sha1 = (text) => createHash("sha1").update(text).digest("hex");
-export const dayNumber = (ms = Date.now()) => Math.floor(ms / 86400000);
 
 function makeLog(verbose = true) {
   return (...a) => { if (verbose) console.error(new Date().toISOString().slice(11, 19), ...a); };
@@ -102,8 +101,25 @@ async function getText(fetchFn, url, { headers = {}, timeoutMs = 90000 } = {}) {
 
 // ---- el índice anterior ----------------------------------------------------------
 
-// { status: "ok" | "none" | "error", manifest, entries: Map(key -> entry), miss }
+export const revisionOf = (iso) => String(iso || "").replace(/[-:]/g, "");
+
+function h32(s, seed) {
+  let h = seed;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+  return h >>> 0;
+}
+
+// Id estable de un título: no depende del orden ni del trozo, solo de tipo + nombre normalizado + año. Idéntico al del plugin.
+export function idOf(kind, find, year) {
+  const k = `${find}|${year || 0}`;
+  return (kind === "movies" ? "m-" : "s-") + h32(k, 2166136261).toString(36) + h32(k, 0x9747b28c).toString(36);
+}
+
+const emptyPrev = (status) => ({ status, manifest: null, entries: new Map(), files: new Map() });
+
+// { status: "ok" | "none" | "error", manifest, entries: Map(kind:key -> entry), miss, files: Map(nombre -> texto) }
 export async function loadPrevious({ prevDir, prevUrl = PREV_URL, fetchFn = fetch, sleep = sleepMs, log = () => {} }) {
+  const files = new Map();
   const read = async (name) => {
     if (prevDir && existsSync(join(prevDir, "index.json"))) {
       return existsSync(join(prevDir, name)) ? { ok: true, text: readFileSync(join(prevDir, name), "utf8") } : { ok: false, status: 404 };
@@ -122,28 +138,34 @@ export async function loadPrevious({ prevDir, prevUrl = PREV_URL, fetchFn = fetc
     return { ok: false, status: last };
   };
   const m = await read("index.json");
-  if (!m.ok) return { status: m.status === 404 ? "none" : "error", manifest: null, entries: new Map(), miss: {} };
+  if (!m.ok) return emptyPrev(m.status === 404 ? "none" : "error");
   let manifest;
-  try { manifest = JSON.parse(m.text); } catch (_) { return { status: "error", manifest: null, entries: new Map(), miss: {} }; }
+  try { manifest = JSON.parse(m.text); } catch (_) { return emptyPrev("error"); }
+  files.set("index.json", m.text);
   const entries = new Map();
   for (const kind of ["movies", "series"]) {
     for (const part of (manifest[kind] && manifest[kind].parts) || []) {
       const r = await read(part);
-      if (!r.ok) return { status: "error", manifest: null, entries: new Map(), miss: {} };
+      if (!r.ok) return emptyPrev("error");
+      files.set(part, r.text);
       const p = JSON.parse(r.text);
       const names = p.name === "" ? [] : p.name.split("\n");
-      const finds = p.find === "" ? [] : p.find.split("\n");
       names.forEach((name, i) => {
         const year = p.year[i] || 0;
-        entries.set(kind + ":" + keyOf(finds[i], year), { kind, name, find: finds[i], year, tmdb: p.tmdb[i] || 0, cats: new Set(p.cats[i] || []) });
+        const find = findKey(name);
+        entries.set(kind + ":" + keyOf(find, year), { kind, name, find, year, tmdb: p.tmdb[i] || 0, cats: new Set(p.cats[i] || []) });
       });
     }
   }
-  let miss = {};
-  const mc = await read("tmdb-cache.json");
-  if (mc.ok) { try { miss = JSON.parse(mc.text).miss || {}; } catch (_) { miss = {}; } }
-  log(`índice anterior: ${entries.size} títulos`);
-  return { status: "ok", manifest, entries, miss };
+  const cats = await read("categories.json");
+  if (cats.ok) files.set("categories.json", cats.text);
+  for (const d of manifest.deltas || []) {
+    const r = await read(d.file);
+    if (!r.ok) { manifest.deltas = []; break; } // cadena rota: sin deltas, el plugin usará el snapshot
+    files.set(d.file, r.text);
+  }
+  log(`índice anterior: ${entries.size} títulos, revisión ${manifest.revision || "(sin revisión)"}, ${(manifest.deltas || []).length} deltas`);
+  return { status: "ok", manifest, entries, files };
 }
 
 // ---- bootstrap y API del servicio -----------------------------------------------
@@ -248,7 +270,26 @@ export function visibleCategories(kind, list) {
 
 // ---- recolección ----------------------------------------------------------------
 
-function addItems(entries, kind, items, catId) {
+// Categorías "calientes": las que cambian a diario. El resto se barre una vez por semana.
+export const SERIES_HOT = ["netflix", "disney", "hbo", "max", "amazon", "apple tv", "paramount"];
+const normCat = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+export function isHotCategory(kind, name, year = new Date().getUTCFullYear()) {
+  const t = normCat(name);
+  if (kind === "vod") {
+    if (/\b(estrenos?|new releases?)\b/.test(t)) return true;
+    const m = t.match(/\b(?:cine|movies?|peliculas?) ((?:19|20)\d\d)\b/);
+    return !!m && (Number(m[1]) === year || Number(m[1]) === year - 1);
+  }
+  return SERIES_HOT.some((w) => ` ${t} `.includes(` ${w} `));
+}
+
+const cloneEntry = (e) => ({ ...e, cats: new Set(e.cats) });
+
+// Añade los items de una categoría. Un título que ya estaba en el índice anterior se copia tal cual (nombre, TMDB); solo
+// los nuevos se procesan de cero. Devuelve las claves vistas en esta categoría.
+function addItems(entries, prev, kind, items, catId, isNew) {
+  const seenHere = new Set();
   for (const x of items) {
     const raw = x.name || x.title;
     if (!raw) continue;
@@ -257,27 +298,48 @@ function addItems(entries, kind, items, catId) {
     const find = findKey(name);
     if (!find) continue;
     const k = kind + ":" + keyOf(find, year);
-    const e = entries.get(k);
-    if (e) e.cats.add(catId);
-    else entries.set(k, { kind, name, find, year, tmdb: 0, cats: new Set([catId]) });
+    seenHere.add(k);
+    let e = entries.get(k);
+    if (!e) {
+      const p = prev.entries.get(k);
+      if (p) e = { ...p, cats: new Set() };
+      else { e = { kind, name, find, year, tmdb: 0, cats: new Set() }; isNew.add(k); }
+      entries.set(k, e);
+    }
+    e.cats.add(catId);
   }
+  return seenHere;
 }
 
-// Recorre las categorías de películas y series. Devuelve { entries, ok, failed, total }.
-export async function collect({ client, prev, log, deadline, now = Date.now }) {
+// mode "full": recorre todas las categorías visibles. mode "partial": solo las calientes, sobre una copia del índice anterior
+// (detecta altas y bajas dentro de ellas). Devuelve { entries, ok, failed, total, isNew, mode }.
+export async function collect({ client, prev, log, deadline, now = Date.now, mode = "full", year = new Date(now()).getUTCFullYear() }) {
+  const partial = mode === "partial";
   const entries = new Map();
+  if (partial) for (const [k, e] of prev.entries) entries.set(k, cloneEntry(e));
+  const isNew = new Set();
   const status = { ok: 0, failed: [], total: 0, skipped: 0 };
   const failedByKind = { movies: new Set(), series: new Set() };
   for (const [kind, label, listAction, itemsAction] of [["movies", "vod", "get_vod_categories", "get_vod_streams"], ["series", "series", "get_series_categories", "get_series"]]) {
-    const cats = visibleCategories(label, await client.call(listAction));
+    let cats = visibleCategories(label, await client.call(listAction));
+    const visible = cats.length;
+    if (partial) cats = cats.filter((c) => isHotCategory(label, c.name, year));
     status.total += cats.length;
-    log(`${label}: ${cats.length} categorías visibles`);
+    log(`${label}: ${cats.length} categorías${partial ? ` calientes de ${visible}` : " visibles"}`);
     for (let i = 0; i < cats.length; i++) {
       if (now() > deadline) { for (const c of cats.slice(i)) { status.failed.push(`${label}:${c.id}`); failedByKind[kind].add(c.id); } status.skipped = cats.length - i; log("tiempo agotado: el resto se conserva del índice anterior"); break; }
       try {
         const items = await client.call(itemsAction, { category_id: String(cats[i].id) });
         if (!Array.isArray(items)) throw new Error("no es lista");
-        addItems(entries, kind, items, cats[i].id);
+        const seenHere = addItems(entries, prev, kind, items, cats[i].id, isNew);
+        if (partial) {
+          // Lo que estaba en esta categoría y hoy ya no: se le quita la categoría; sin categorías, el título desaparece.
+          for (const [k, e] of entries) {
+            if (e.kind !== kind || !e.cats.has(cats[i].id) || seenHere.has(k)) continue;
+            e.cats.delete(cats[i].id);
+            if (!e.cats.size) entries.delete(k);
+          }
+        }
         status.ok++;
         log(`${label} ${i + 1}/${cats.length}: ${items.length} títulos`);
       } catch (e) {
@@ -288,93 +350,28 @@ export async function collect({ client, prev, log, deadline, now = Date.now }) {
       await client.pause();
     }
   }
-  // Lo que no se pudo leer hoy se conserva de ayer: solo las pertenencias a esas categorías.
+  // Barrido completo: lo que no se pudo leer hoy se conserva de ayer (solo sus pertenencias a esas categorías).
   let kept = 0;
-  for (const [k, p] of prev.entries) {
-    const lost = [...p.cats].filter((c) => failedByKind[p.kind].has(c));
-    if (!lost.length) continue;
-    let e = entries.get(k);
-    if (!e) { e = { kind: p.kind, name: p.name, find: p.find, year: p.year, tmdb: p.tmdb, cats: new Set() }; entries.set(k, e); kept++; }
-    for (const c of lost) e.cats.add(c);
+  if (!partial) {
+    for (const [k, p] of prev.entries) {
+      const lost = [...p.cats].filter((c) => failedByKind[p.kind].has(c));
+      if (!lost.length) continue;
+      let e = entries.get(k);
+      if (!e) { e = { ...p, cats: new Set() }; entries.set(k, e); kept++; }
+      for (const c of lost) e.cats.add(c);
+    }
   }
   if (kept) log(`conservados del índice anterior: ${kept} títulos de categorías que fallaron`);
-  return { entries, ...status };
+  return { entries, ...status, isNew, mode };
 }
 
-// ---- TMDB -----------------------------------------------------------------------
-
-function yearOfResult(r, kind) {
-  const d = kind === "movies" ? r.release_date : r.first_air_date;
-  return /^\d{4}/.test(d || "") ? Number(d.slice(0, 4)) : 0;
-}
-
-// Coincidencia segura: título (o título original) igual y año ±1, o un único resultado compatible con el año.
-export function pickTmdb(results, entry) {
-  const list = Array.isArray(results) ? results : [];
-  const okYear = (r) => !entry.year || !yearOfResult(r, entry.kind) || Math.abs(yearOfResult(r, entry.kind) - entry.year) <= 1;
-  const same = list.filter((r) => [r.title, r.name, r.original_title, r.original_name].some((t) => t && findKey(t) === entry.find) && okYear(r));
-  if (same.length) return same[0].id;
-  if (list.length === 1 && okYear(list[0]) && entry.year) return list[0].id;
-  return 0;
-}
-
-export async function tmdbPhase({ entries, prev, apiKey, base = "https://api.themoviedb.org/3", fetchFn = fetch, sleep = sleepMs, rps = 4, deadline, now = Date.now, today = dayNumber(), log }) {
-  const stats = { cached: 0, queried: 0, retried: 0, found: 0, missed: 0, skippedFresh: 0, deferred: 0 };
-  const miss = {};
-  // Los ids ya conocidos salen del índice anterior; los sin coincidencia recientes no se vuelven a buscar.
-  const queue = [];
-  const retries = [];
-  for (const [k, e] of entries) {
-    const p = prev.entries.get(k);
-    if (p && p.tmdb > 0) { e.tmdb = p.tmdb; stats.cached++; continue; }
-    const mk = k;
-    const tried = prev.miss[mk];
-    if (tried !== undefined) {
-      if (today - tried < MISS_RETRY_DAYS) { miss[mk] = tried; stats.skippedFresh++; continue; }
-      retries.push([k, e]);
-    } else queue.push([k, e]);
-  }
-  const work = [...queue, ...retries.slice(0, MISS_RETRY_CAP)];
-  for (const [k] of retries.slice(MISS_RETRY_CAP)) { miss[k] = prev.miss[k]; stats.deferred++; }
-  log(`TMDB: ${stats.cached} ids de caché, ${queue.length} claves nuevas, ${Math.min(retries.length, MISS_RETRY_CAP)} reintentos (≥${MISS_RETRY_DAYS} días), ${stats.skippedFresh} sin coincidencia reciente`);
-  if (!apiKey) { log("TMDB: sin clave, no se consulta"); stats.deferred += work.length; return { stats, miss: { ...prev.miss, ...miss } }; }
-
-  const bearer = apiKey.length > 40;
-  let netFails = 0;
-  for (let i = 0; i < work.length; i++) {
-    const [k, e] = work[i];
-    if (now() > deadline) { stats.deferred += work.length - i; log("TMDB: tiempo agotado, el resto queda para la próxima corrida"); break; }
-    const mk = k;
-    const q = new URLSearchParams({ query: e.name, language: "es-MX", include_adult: "false" });
-    if (e.year) q.set(e.kind === "movies" ? "year" : "first_air_date_year", String(e.year));
-    if (!bearer) q.set("api_key", apiKey);
-    let done = false;
-    for (let attempt = 0; attempt < 3 && !done; attempt++) {
-      try {
-        const r = await fetchFn(`${base}/search/${e.kind === "movies" ? "movie" : "tv"}?${q}`, { headers: bearer ? { Authorization: `Bearer ${apiKey}`, Accept: "application/json" } : { Accept: "application/json" }, signal: AbortSignal.timeout(30000) });
-        if (r.status === 429) { await sleep(Math.min(60, Number(r.headers.get("retry-after")) || 5) * 1000); continue; }
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        const data = await r.json();
-        const id = pickTmdb(data.results, e);
-        netFails = 0;
-        done = true;
-        if (id) { e.tmdb = id; stats.found++; } else { miss[mk] = today; stats.missed++; }
-        if (prev.miss[mk] !== undefined) stats.retried++; else stats.queried++;
-      } catch (err) { netFails++; await sleep(2000 * (attempt + 1)); }
-    }
-    if (!done && netFails >= 8) { stats.deferred += work.length - i; log("TMDB: demasiados fallos seguidos, se detiene"); break; }
-    await sleep(1000 / rps);
-  }
-  return { stats, miss };
-}
-
-// ---- trozos y manifiesto --------------------------------------------------------
+// ---- trozos, deltas y manifiesto --------------------------------------------------
 
 const fnv = (s) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h >>> 0; };
 
 function partJson(list) {
   return JSON.stringify({
-    name: list.map((e) => e.name).join("\n"), find: list.map((e) => e.find).join("\n"),
+    name: list.map((e) => e.name).join("\n"),
     year: list.map((e) => e.year), tmdb: list.map((e) => e.tmdb), cats: list.map((e) => [...e.cats].sort((a, b) => a - b)),
   });
 }
@@ -394,9 +391,28 @@ export function buildParts(kind, entries, limit = PART_LIMIT) {
   throw new Error("no se pudo repartir");
 }
 
-export function buildOutput({ entries, miss, coverage, generated, categoriesJson, prevHash }) {
+export const DELTAS_KEPT = 7;
+const sameCats = (a, b) => a.size === b.size && [...a].every((c) => b.has(c));
+const wire = (e) => ({ k: e.kind === "movies" ? "m" : "s", n: e.name, y: e.year, t: e.tmdb, c: [...e.cats].sort((a, b) => a - b) });
+
+// Qué cambió entre dos índices: títulos nuevos o modificados (nombre, TMDB, categorías) y los ids de los que desaparecieron.
+export function computeDelta(prevEntries, entries, from, to) {
+  const added = [];
+  const removed = [];
+  for (const [k, e] of entries) {
+    const p = prevEntries.get(k);
+    if (!p || p.tmdb !== e.tmdb || p.name !== e.name || !sameCats(p.cats, e.cats)) added.push(wire(e));
+  }
+  for (const [k, p] of prevEntries) if (!entries.has(k)) removed.push(idOf(p.kind, p.find, p.year));
+  return { from, to, total: entries.size, added, removed };
+}
+
+// Una revisión completa (puro, sin disco): snapshot por trozos + delta contra la anterior + deltas conservados.
+// { changed, files, manifest }: si el contenido no cambió, el manifiesto es el anterior (misma revisión).
+export function buildRevision({ entries, prev, coverage, generated, fullAt, categoriesJson }) {
+  const revision = revisionOf(generated);
   const files = new Map();
-  const manifest = { v: FORMAT, generated, coverage: Math.round(coverage * 1000) / 1000, categories: "categories.json" };
+  const manifest = { v: FORMAT, generated, revision, fullAt, coverage: Math.round(coverage * 1000) / 1000, categories: "categories.json" };
   const hashes = [];
   for (const kind of ["movies", "series"]) {
     const { count, files: parts } = buildParts(kind, entries);
@@ -411,12 +427,25 @@ export function buildOutput({ entries, miss, coverage, generated, categoriesJson
   }
   files.set("categories.json", categoriesJson);
   hashes.push(sha1(categoriesJson));
-  const missJson = JSON.stringify({ v: 1, miss });
-  hashes.push(sha1(missJson));
   manifest.hash = sha1(hashes.join("|")).slice(0, 16);
-  files.set("tmdb-cache.json", missJson);
+
+  const pm = prev && prev.manifest;
+  if (pm && pm.hash === manifest.hash) return { changed: false, files: new Map(prev.files), manifest: pm };
+
+  manifest.deltas = [];
+  if (pm && pm.revision && prev.entries.size) {
+    const delta = computeDelta(prev.entries, entries, pm.revision, revision);
+    const name = `delta-${pm.revision}-${revision}.json`;
+    const text = JSON.stringify(delta);
+    const chain = (pm.deltas || []).filter((d, i, a) => (i === 0 || d.from === a[i - 1].to) && prev.files.has(d.file));
+    const lastOk = chain.length && chain[chain.length - 1].to === pm.revision;
+    const keep = (lastOk ? chain : []).slice(-(DELTAS_KEPT - 1));
+    for (const d of keep) files.set(d.file, prev.files.get(d.file));
+    manifest.deltas = [...keep, { from: pm.revision, to: revision, file: name, added: delta.added.length, removed: delta.removed.length, bytes: Buffer.byteLength(text) }];
+    files.set(name, text);
+  }
   files.set("index.json", JSON.stringify(manifest));
-  return { manifest, files, changed: manifest.hash !== prevHash };
+  return { changed: true, files, manifest };
 }
 
 export function categoriesJson() {
@@ -425,10 +454,18 @@ export function categoriesJson() {
 
 // ---- ejecución completa ---------------------------------------------------------
 
+// ¿Toca barrido completo? Sin índice anterior (o sin revisión), pasados 7 días del último, los domingos, o si se pide.
+export function fullSweepDue(prevManifest, nowMs, full = false) {
+  if (full || !prevManifest || !prevManifest.revision || !prevManifest.fullAt) return true;
+  const age = nowMs - Date.parse(prevManifest.fullAt);
+  if (!(age >= 0) || age > 7 * 86400000) return true;
+  return new Date(nowMs).getUTCDay() === 0 && age > 20 * 3600 * 1000;
+}
+
 export async function run(opts) {
   const {
-    out = "dist", prevDir = "prev", prevUrl = PREV_URL, hours = 4.5, iptvMinutes = 150, force = false, apiKey = process.env.TMDB_API_KEY || "",
-    fetchFn = fetch, sleep = sleepMs, bootstrapUrl = BOOTSTRAP, tmdbBase, minDelay, maxDelay, rps = 4, verbose = true, now = Date.now,
+    out = "dist", prevDir = "prev", prevUrl = PREV_URL, iptvMinutes = 150, force = false, full = false,
+    fetchFn = fetch, sleep = sleepMs, bootstrapUrl = BOOTSTRAP, minDelay, maxDelay, verbose = true, now = Date.now,
   } = opts;
   const log = makeLog(verbose);
   const t0 = now();
@@ -437,26 +474,29 @@ export async function run(opts) {
     log("no se pudo descargar el índice anterior: no se asume vacío; se aborta sin publicar");
     return { published: false, reason: "prev-error" };
   }
+  const mode = fullSweepDue(prev.manifest, t0, full) ? "full" : "partial";
+  log(`modo: ${mode === "full" ? "barrido completo" : "refresco de categorías calientes"}`);
   const servers = await getServerList({ bootstrapUrl, fetchFn, log });
   const client = makeClient({ servers, fetchFn, sleep, minDelay, maxDelay, log });
-  const col = await collect({ client, prev, log, deadline: t0 + iptvMinutes * 60000, now });
-  const coverage = col.total ? col.ok / col.total : 0;
-  log(`cobertura ${(coverage * 100).toFixed(1)}% (${col.ok}/${col.total} categorías), ${col.entries.size} títulos, ${client.calls} peticiones al servicio`);
-  if (coverage < MIN_COVERAGE) { log(`cobertura < ${MIN_COVERAGE}: no se publica`); return { published: false, reason: "coverage", coverage }; }
-
-  const tm = await tmdbPhase({ entries: col.entries, prev, apiKey, base: tmdbBase, fetchFn, sleep, rps, deadline: t0 + hours * 3600000, now, log });
-  log(`TMDB: ${tm.stats.cached} de caché, ${tm.stats.queried} consultas nuevas, ${tm.stats.retried} reintentos, ${tm.stats.found} encontrados, ${tm.stats.missed} sin coincidencia, ${tm.stats.deferred} pendientes`);
+  const col = await collect({ client, prev, log, deadline: t0 + iptvMinutes * 60000, now, mode });
+  const swept = col.total ? col.ok / col.total : 0;
+  log(`categorías leídas ${col.ok}/${col.total} (${(swept * 100).toFixed(1)}%), ${col.entries.size} títulos (${col.isNew.size} nuevos), ${client.calls} peticiones al servicio`);
+  if (swept < MIN_COVERAGE) { log(`cobertura < ${MIN_COVERAGE}: no se publica`); return { published: false, reason: "coverage", coverage: swept }; }
+  // La cobertura publicada es la del último barrido completo: un refresco parcial no la mejora ni la empeora.
+  const coverage = mode === "full" ? swept : Number(prev.manifest.coverage) || swept;
+  const fullAt = mode === "full" ? new Date(t0).toISOString().replace(/\.\d+Z$/, "Z") : prev.manifest.fullAt;
 
   const generated = new Date(now()).toISOString().replace(/\.\d+Z$/, "Z");
-  const o = buildOutput({ entries: col.entries, miss: tm.miss, coverage, generated, categoriesJson: categoriesJson(), prevHash: prev.manifest ? prev.manifest.hash : "" });
+  const o = buildRevision({ entries: col.entries, prev, coverage, generated, fullAt, categoriesJson: categoriesJson() });
   if (!o.changed && !force) { log("sin cambios respecto al índice anterior: no se publica"); return { published: false, reason: "unchanged", manifest: o.manifest }; }
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });
   for (const [name, text] of o.files) writeFileSync(join(out, name), text);
   const bytes = [...o.files.values()].reduce((n, t) => n + Buffer.byteLength(t), 0);
-  log(`escrito ${o.files.size} archivos (${(bytes / 1048576).toFixed(2)} MB) en ${out}; ${((now() - t0) / 60000).toFixed(1)} min`);
+  const last = (o.manifest.deltas || []).slice(-1)[0];
+  log(`escrito ${o.files.size} archivos (${(bytes / 1048576).toFixed(2)} MB) en ${out}; revisión ${o.manifest.revision}${o.changed && last ? `, delta +${last.added} -${last.removed}` : o.changed ? "" : " (sin cambios de contenido)"}; ${((now() - t0) / 60000).toFixed(1)} min`);
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, "changed=true\n");
-  return { published: true, manifest: o.manifest, stats: tm.stats, coverage, entries: col.entries.size };
+  return { published: true, changed: o.changed, mode, manifest: o.manifest, coverage, entries: col.entries.size, isNew: col.isNew.size, requests: client.calls };
 }
 
 function parseArgs(argv) {
@@ -465,12 +505,11 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === "--out") o.out = argv[++i];
     else if (a === "--prev") o.prevDir = argv[++i];
-    else if (a === "--hours") o.hours = Number(argv[++i]);
     else if (a === "--iptv-minutes") o.iptvMinutes = Number(argv[++i]);
     else if (a === "--min-delay") o.minDelay = Number(argv[++i]);
     else if (a === "--max-delay") o.maxDelay = Number(argv[++i]);
-    else if (a === "--tmdb-rps") o.rps = Number(argv[++i]);
     else if (a === "--force") o.force = true;
+    else if (a === "--full") o.full = true;
   }
   return o;
 }
