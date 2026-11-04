@@ -101,6 +101,10 @@ async function getText(fetchFn, url, { headers = {}, timeoutMs = 90000 } = {}) {
 
 // ---- el índice anterior ----------------------------------------------------------
 
+// Etiqueta del servidor del que salen los ids de categoría y la numeración del índice: cada servidor numera y organiza las suyas, así que
+// el plugin solo usa el índice con el servidor que lo generó (no es secreta: es un hash corto del host).
+export const sourceTag = (base) => h32(String(base), 2166136261).toString(36);
+
 export const revisionOf = (iso) => String(iso || "").replace(/[-:]/g, "");
 
 function h32(s, seed) {
@@ -245,7 +249,7 @@ export function makeClient({ servers, fetchFn = fetch, sleep = sleepMs, minDelay
   }
 
   async function pause() { await sleep(minDelay + rand() * Math.max(0, maxDelay - minDelay)); }
-  return { call, pause, get calls() { return calls; }, get server() { return idx + 1; } };
+  return { call, pause, get calls() { return calls; }, get server() { return idx + 1; }, get source() { return sourceTag(list[idx].base); } };
 }
 
 // ---- categorías -----------------------------------------------------------------
@@ -409,10 +413,10 @@ export function computeDelta(prevEntries, entries, from, to) {
 
 // Una revisión completa (puro, sin disco): snapshot por trozos + delta contra la anterior + deltas conservados.
 // { changed, files, manifest }: si el contenido no cambió, el manifiesto es el anterior (misma revisión).
-export function buildRevision({ entries, prev, coverage, generated, fullAt, categoriesJson }) {
+export function buildRevision({ entries, prev, coverage, generated, fullAt, categoriesJson, source }) {
   const revision = revisionOf(generated);
   const files = new Map();
-  const manifest = { v: FORMAT, generated, revision, fullAt, coverage: Math.round(coverage * 1000) / 1000, categories: "categories.json" };
+  const manifest = { v: FORMAT, generated, revision, fullAt, coverage: Math.round(coverage * 1000) / 1000, categories: "categories.json", ...(source ? { src: source } : {}) };
   const hashes = [];
   for (const kind of ["movies", "series"]) {
     const { count, files: parts } = buildParts(kind, entries);
@@ -487,7 +491,7 @@ export async function run(opts) {
   const fullAt = mode === "full" ? new Date(t0).toISOString().replace(/\.\d+Z$/, "Z") : prev.manifest.fullAt;
 
   const generated = new Date(now()).toISOString().replace(/\.\d+Z$/, "Z");
-  const o = buildRevision({ entries: col.entries, prev, coverage, generated, fullAt, categoriesJson: categoriesJson() });
+  const o = buildRevision({ entries: col.entries, prev, coverage, generated, fullAt, categoriesJson: categoriesJson(), source: client.source });
   if (!o.changed && !force) { log("sin cambios respecto al índice anterior: no se publica"); return { published: false, reason: "unchanged", manifest: o.manifest }; }
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });
