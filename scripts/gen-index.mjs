@@ -434,7 +434,12 @@ export function buildRevision({ entries, prev, coverage, generated, fullAt, cate
   manifest.hash = sha1(hashes.join("|")).slice(0, 16);
 
   const pm = prev && prev.manifest;
-  if (pm && pm.hash === manifest.hash) return { changed: false, files: new Map(prev.files), manifest: pm };
+  if (pm && pm.hash === manifest.hash) {
+    const files2 = new Map(prev.files);
+    // Mismos datos: solo se añade (o corrige) la etiqueta del servidor, sin cambiar la revisión.
+    if (source && pm.src !== source) { const m2 = { ...pm, src: source }; files2.set("index.json", JSON.stringify(m2)); return { changed: true, files: files2, manifest: m2 }; }
+    return { changed: false, files: files2, manifest: pm };
+  }
 
   manifest.deltas = [];
   if (pm && pm.revision && prev.entries.size) {
