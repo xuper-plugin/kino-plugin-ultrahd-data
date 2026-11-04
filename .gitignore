@@ -4,3 +4,4 @@ prev/
 *.log
 .env
 *.done
+dist*/
