@@ -4,7 +4,7 @@ import http from "node:http";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, cpSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cleanTitle, findKey, idOf, run, fullSweepDue, isHotCategory, revisionOf, DELTAS_KEPT } from "./gen-index.mjs";
+import { cleanTitle, findKey, idOf, run, fullSweepDue, isHotCategory, revisionOf, DELTAS_KEPT, panelFit, panelReference, sweepMode, sourceTag } from "./gen-index.mjs";
 import { checkIndex } from "./check-index.mjs";
 
 let passed = 0;
@@ -38,11 +38,21 @@ const fresh = () => ({
 });
 const data = fresh();
 
+// Accounts of the fake service. U1 and U2 are of the index's panel; OTHER is another panel (same ids, other categories);
+// AUTH0 rejects its login; SUB is of the panel but lacks a category. [authAfter] / [downAfter]: after that many answers the
+// account rejects its login / stops answering.
+const OTHER_VOD = CATS_VOD.map((c, i) => ({ category_id: c.category_id, category_name: "DEPORTES " + i }));
+const ACCOUNTS = {
+  U1: { pass: "P1" }, U2: { pass: "P2" }, OTHER: { pass: "P3", vod: OTHER_VOD }, AUTH0: { pass: "P4", auth0: true },
+  SUB: { pass: "P5", vod: CATS_VOD.filter((c) => c.category_id !== "1149") },
+};
+const line = (p, user) => `http://127.0.0.1:${p}/get.php?username=${user}&password=${ACCOUNTS[user].pass}&type=m3u_plus`;
+
 function fakeIptv(state) {
   const s = http.createServer((req, res) => {
     const u = new URL(req.url, "http://x");
     if (u.pathname === "/bootstrap.php") {
-      if (u.searchParams.get("servers")) { res.end(`http://127.0.0.1:${state.deadPort}/get.php?username=DEAD&password=DEAD&type=m3u_plus\nhttp://127.0.0.1:${port(s)}/get.php?username=U1&password=P1&type=m3u_plus 🌐\n`); return; }
+      if (u.searchParams.get("servers")) { res.end(state.lines ? state.lines() : `http://127.0.0.1:${state.deadPort}/get.php?username=DEAD&password=DEAD&type=m3u_plus\n${line(port(s), "U1")} 🌐\n`); return; }
       const code = Number(req.headers["x-vegeta-version-code"] || 0);
       state.codes.push(code);
       if (code < 22) { res.statusCode = 426; res.end(JSON.stringify({ ok: false, error: "upgrade_required", minimum_version_code: 22, latest_version_code: 22 })); return; }
@@ -52,10 +62,16 @@ function fakeIptv(state) {
     if (u.pathname === "/player_api.php") {
       const action = u.searchParams.get("action");
       const cat = u.searchParams.get("category_id");
+      const user = u.searchParams.get("username");
       state.calls.push(`${action}:${cat || ""}`);
-      if (u.searchParams.get("username") !== "U1") { res.statusCode = 403; res.end("{}"); return; }
+      state.who.push(`${user}:${action}:${cat || ""}`);
+      const acct = ACCOUNTS[user];
+      if (!acct || u.searchParams.get("password") !== acct.pass) { res.statusCode = 403; res.end("{}"); return; }
+      if (acct.auth0 || (acct.authAfter !== undefined && (acct.served || 0) >= acct.authAfter)) { res.end(JSON.stringify({ user_info: { auth: 0 } })); return; }
+      if (acct.downAfter !== undefined && (acct.served || 0) >= acct.downAfter) { res.statusCode = 502; res.end("down"); return; }
+      acct.served = (acct.served || 0) + 1;
       if (cat && state.failCats.has(cat)) { res.statusCode = 500; res.end("boom"); return; }
-      const body = action === "get_vod_categories" ? CATS_VOD : action === "get_series_categories" ? CATS_SERIES
+      const body = action === "get_vod_categories" ? acct.vod || CATS_VOD : action === "get_series_categories" ? CATS_SERIES
         : action === "get_vod_streams" ? data.vod[cat] : action === "get_series" ? data.series[cat] : null;
       res.end(JSON.stringify(body || []));
       return;
@@ -66,9 +82,15 @@ function fakeIptv(state) {
 }
 
 const dead = await listen((req, res) => { res.statusCode = 500; res.end("dead"); });
-const state = { deadPort: port(dead), codes: [], calls: [], failCats: new Set() };
+const state = { deadPort: port(dead), codes: [], calls: [], who: [], failCats: new Set(), lines: null };
 const iptv = fakeIptv(state);
 await new Promise((r) => iptv.listen(0, "127.0.0.1", r));
+// Two more hosts of the same fake service: an account's server tag (src) depends on its host.
+const iptv2 = fakeIptv(state);
+await new Promise((r) => iptv2.listen(0, "127.0.0.1", r));
+const iptv3 = fakeIptv(state);
+await new Promise((r) => iptv3.listen(0, "127.0.0.1", r));
+const tagOf = (s) => sourceTag(`http://127.0.0.1:${port(s)}`);
 const bootstrapUrl = `http://127.0.0.1:${port(iptv)}/bootstrap.php`;
 const noPrev = await listen((req, res) => { res.statusCode = 404; res.end("nope"); });
 const brokenPrev = await listen((req, res) => { res.statusCode = 500; res.end("err"); });
@@ -123,6 +145,32 @@ try {
     assert.equal(new Date(sunday).getUTCDay(), 0);
     assert.equal(fullSweepDue({ ...m, fullAt: "2026-11-07T07:17:00Z" }, sunday), true, "domingo");
     assert.equal(fullSweepDue({ ...m, fullAt: "2026-11-08T05:00:00Z" }, sunday), false, "domingo, pero ya hubo barrido hoy");
+  });
+
+  await test("encaje con el panel: mismo id y mismo nombre (como lo escribe la tabla); sin índice anterior sirve cualquiera", () => {
+    const ref = new Map([["1147", "Estrenos 2026"], ["1126", "Acción"]]);
+    assert.equal(panelFit([{ category_id: "1147", category_name: "ESTRENOS 2026 - (LAT)" }, { category_id: 1126, category_name: "ACCION - (LAT)" }], ref), 1);
+    assert.equal(panelFit([{ category_id: "1147", category_name: "ESTRENOS 2026 - (LAT)" }, { category_id: "1126", category_name: "DEPORTES" }], ref), 0.5);
+    assert.equal(panelFit([{ category_id: "9", category_name: "ESTRENOS 2026 - (LAT)" }], ref), 0, "otro id");
+    assert.equal(panelFit([], new Map()), 1);
+    const prev = {
+      entries: new Map([["movies:a|0", { kind: "movies", cats: new Set([1147, 9999]) }], ["series:b|0", { kind: "series", cats: new Set([684]) }]]),
+      files: new Map([["categories.json", JSON.stringify({ v: 1, vod: { 1147: ["Estrenos 2026", "es-419", "estrenos", 0, "H"], 1126: ["Acción", "es-419", "generos", 1, ""] } })]]),
+    };
+    assert.deepEqual([...panelReference(prev)], [["1147", "Estrenos 2026"]], "solo las categorías de películas que usa el índice, con su nombre publicado");
+    assert.equal(panelReference({ entries: new Map(), files: new Map() }).size, 0);
+  });
+
+  await test("modo: otra cuenta que la del índice anterior = barrido completo; --hot fuerza el parcial si hay índice", () => {
+    const t = Date.parse("2026-11-03T07:17:00Z"); // martes
+    const m = { revision: "x", fullAt: "2026-11-02T07:17:00Z", src: "abc" };
+    assert.equal(sweepMode({ prevManifest: m, nowMs: t, source: "abc" }), "partial");
+    assert.equal(sweepMode({ prevManifest: m, nowMs: t, source: "xyz" }), "full");
+    assert.equal(sweepMode({ prevManifest: { ...m, src: undefined }, nowMs: t, source: "xyz" }), "partial", "índice sin src");
+    assert.equal(sweepMode({ prevManifest: { ...m, fullAt: "2026-10-01T00:00:00Z" }, nowMs: t, source: "abc" }), "full", "toca barrido");
+    assert.equal(sweepMode({ prevManifest: { ...m, fullAt: "2026-10-01T00:00:00Z" }, nowMs: t, source: "xyz", hot: true }), "partial", "--hot");
+    assert.equal(sweepMode({ prevManifest: null, nowMs: t, hot: true }), "full", "--hot sin índice");
+    assert.equal(sweepMode({ prevManifest: m, nowMs: t, source: "abc", hot: true, full: true }), "full", "--full gana");
   });
 
   const out1 = join(tmp, "out1");
@@ -244,6 +292,94 @@ try {
     assert.equal(state.calls.length, n);
   });
 
+  const waitsInto = (list) => async (ms) => { if (ms >= 10000) list.push(ms); };
+  const accountsOf = (users) => () => users.map(([s, user]) => line(port(s), user)).join("\n");
+
+  await test("elige la cuenta por las categorías del índice: la que rechaza el login se salta sin esperar, la de otro panel no se usa; src = la usada", async () => {
+    state.lines = accountsOf([[iptv, "AUTH0"], [iptv3, "OTHER"], [iptv2, "U2"]]);
+    const waits = [];
+    const mark = state.who.length;
+    const r = await run({ ...base, sleep: waitsInto(waits), out: join(tmp, "acc1"), prevDir: out3 });
+    state.lines = null;
+    const who = state.who.slice(mark);
+    assert.equal(r.published, true);
+    assert.equal(r.mode, "full", "otra cuenta que la del índice anterior: barrido completo");
+    assert.equal(r.manifest.src, tagOf(iptv2));
+    assert.deepEqual(who.filter((w) => !w.startsWith("U2:")), ["AUTH0:get_vod_categories:", "OTHER:get_vod_categories:"], "una sola prueba a cada una");
+    assert.ok(who.includes("U2:get_vod_streams:1126"));
+    assert.deepEqual(waits, [], "ninguna espera por la cuenta no válida");
+    assert.deepEqual(checkIndex(join(tmp, "acc1")), []);
+  });
+
+  await test("a mitad del barrido, la cuenta que rechaza el login se cambia en el acto por otra del mismo panel, nunca por otro panel", async () => {
+    ACCOUNTS.U1.served = 0;
+    ACCOUNTS.U1.authAfter = 2; // the probe and one category, then the login is rejected
+    state.lines = accountsOf([[iptv, "U1"], [iptv3, "OTHER"], [iptv2, "U2"]]);
+    const waits = [];
+    const mark = state.who.length;
+    const r = await run({ ...base, sleep: waitsInto(waits), out: join(tmp, "acc2"), prevDir: out3 });
+    state.lines = null;
+    delete ACCOUNTS.U1.authAfter;
+    const who = state.who.slice(mark);
+    assert.equal(r.published, true);
+    assert.equal(r.mode, "partial", "empieza con la cuenta del índice anterior");
+    assert.deepEqual(who.filter((w) => w.startsWith("U1:")), ["U1:get_vod_categories:", "U1:get_vod_streams:1147", "U1:get_vod_streams:1149"]);
+    assert.deepEqual(who.filter((w) => w.startsWith("OTHER:")), ["OTHER:get_vod_categories:"], "otro panel: solo la prueba");
+    assert.ok(who.includes("U2:get_vod_streams:1149") && who.includes("U2:get_series:684"));
+    assert.equal(r.manifest.src, tagOf(iptv2), "src = la cuenta en uso al terminar");
+    assert.deepEqual(waits, []);
+    assert.deepEqual(checkIndex(join(tmp, "acc2")), []);
+  });
+
+  await test("la cuenta que deja de responder se cambia tras 4 fallos seguidos por otra del mismo panel", async () => {
+    ACCOUNTS.U1.served = 0;
+    ACCOUNTS.U1.downAfter = 2;
+    state.lines = accountsOf([[iptv, "U1"], [iptv2, "U2"]]);
+    const waits = [];
+    const r = await run({ ...base, sleep: waitsInto(waits), out: join(tmp, "acc3"), prevDir: out3 });
+    state.lines = null;
+    delete ACCOUNTS.U1.downAfter;
+    assert.equal(r.published, true);
+    assert.equal(r.manifest.src, tagOf(iptv2));
+    assert.deepEqual(waits, [10000, 30000, 90000]);
+  });
+
+  await test("sin otra cuenta del panel no cambia de panel: no publica y el índice anterior queda", async () => {
+    ACCOUNTS.U1.served = 0;
+    ACCOUNTS.U1.authAfter = 2;
+    state.lines = accountsOf([[iptv, "U1"], [iptv3, "OTHER"]]);
+    let mark = state.who.length;
+    const r = await run({ ...base, out: join(tmp, "acc4"), prevDir: out3 });
+    delete ACCOUNTS.U1.authAfter;
+    assert.equal(r.published, false);
+    assert.equal(r.reason, "no-account");
+    assert.deepEqual(state.who.slice(mark).filter((w) => w.startsWith("OTHER:")), ["OTHER:get_vod_categories:"], "nada de otro panel");
+    assert.ok(!existsSync(join(tmp, "acc4")));
+    // From the start: only a rejected login and another panel.
+    state.lines = accountsOf([[iptv, "AUTH0"], [iptv3, "OTHER"]]);
+    mark = state.who.length;
+    const r2 = await run({ ...base, out: join(tmp, "acc5"), prevDir: out3 });
+    state.lines = null;
+    assert.equal(r2.reason, "no-account");
+    assert.deepEqual(state.who.slice(mark), ["AUTH0:get_vod_categories:", "OTHER:get_vod_categories:"]);
+    assert.ok(!existsSync(join(tmp, "acc5")));
+  });
+
+  await test("a una cuenta del panel que no tiene una categoría no se le pide: se conserva del índice anterior", async () => {
+    ACCOUNTS.U1.served = 0;
+    ACCOUNTS.U1.authAfter = 2;
+    state.lines = accountsOf([[iptv, "U1"], [iptv2, "SUB"]]);
+    const mark = state.who.length;
+    const r = await run({ ...base, out: join(tmp, "acc6"), prevDir: out3, minFit: 0.7 }); // SUB carries 3 of the index's 4
+    state.lines = null;
+    delete ACCOUNTS.U1.authAfter;
+    const who = state.who.slice(mark);
+    assert.ok(who.includes("SUB:get_vod_categories:") && who.includes("SUB:get_series:684"));
+    assert.ok(!who.includes("SUB:get_vod_streams:1149"), "1149 no está en SUB");
+    assert.equal(r.published, false);
+    assert.equal(r.reason, "coverage");
+  });
+
   await test("check-index detecta credenciales, desalineación, hashes y cadenas de deltas rotas", () => {
     const bad = join(tmp, "bad");
     cpSync(out3, bad, { recursive: true });
@@ -279,7 +415,7 @@ try {
   });
 } finally {
   console.error = origErr;
-  for (const s of [dead, iptv, noPrev, brokenPrev]) s.close();
+  for (const s of [dead, iptv, iptv2, iptv3, noPrev, brokenPrev]) s.close();
   rmSync(tmp, { recursive: true, force: true });
 }
 console.log(`\n${passed} pruebas OK`);
