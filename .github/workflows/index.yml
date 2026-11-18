@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Publicar aunque no haya cambios"
+        description: "Publicar aunque no haya cambios o aunque las películas o las series pierdan más de un cuarto"
         type: boolean
         default: false
       full:

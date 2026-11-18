@@ -45,6 +45,7 @@ const OTHER_VOD = CATS_VOD.map((c, i) => ({ category_id: c.category_id, category
 const ACCOUNTS = {
   U1: { pass: "P1" }, U2: { pass: "P2" }, OTHER: { pass: "P3", vod: OTHER_VOD }, AUTH0: { pass: "P4", auth0: true },
   SUB: { pass: "P5", vod: CATS_VOD.filter((c) => c.category_id !== "1149") },
+  NOSERIES: { pass: "P6", series: [] },
 };
 const line = (p, user) => `http://127.0.0.1:${p}/get.php?username=${user}&password=${ACCOUNTS[user].pass}&type=m3u_plus`;
 
@@ -71,7 +72,7 @@ function fakeIptv(state) {
       if (acct.downAfter !== undefined && (acct.served || 0) >= acct.downAfter) { res.statusCode = 502; res.end("down"); return; }
       acct.served = (acct.served || 0) + 1;
       if (cat && state.failCats.has(cat)) { res.statusCode = 500; res.end("boom"); return; }
-      const body = action === "get_vod_categories" ? acct.vod || CATS_VOD : action === "get_series_categories" ? CATS_SERIES
+      const body = action === "get_vod_categories" ? acct.vod || CATS_VOD : action === "get_series_categories" ? acct.series || CATS_SERIES
         : action === "get_vod_streams" ? data.vod[cat] : action === "get_series" ? data.series[cat] : null;
       res.end(JSON.stringify(body || []));
       return;
@@ -378,6 +379,22 @@ try {
     assert.ok(!who.includes("SUB:get_vod_streams:1149"), "1149 no está en SUB");
     assert.equal(r.published, false);
     assert.equal(r.reason, "coverage");
+  });
+
+  await test("no publica un índice que pierde más de un cuarto de una sección (una cuenta del panel sin series); con --force sí", async () => {
+    state.lines = accountsOf([[iptv, "NOSERIES"]]);
+    const r = await run({ ...base, out: join(tmp, "shr1"), prevDir: out3, full: true, shrinkMin: 1 });
+    assert.equal(r.published, false);
+    assert.equal(r.reason, "shrink");
+    assert.ok(r.shrunk.some((s) => s.kind === "series" && s.before > 0 && s.after === 0), JSON.stringify(r.shrunk));
+    assert.ok(!existsSync(join(tmp, "shr1")), "nada escrito");
+    const r2 = await run({ ...base, out: join(tmp, "shr2"), prevDir: out3, full: true, shrinkMin: 1, force: true });
+    state.lines = null;
+    assert.equal(r2.published, true);
+    assert.equal(r2.manifest.series.count, 0);
+    // The same run with the account's series: nothing shrank, it publishes without --force.
+    const r3 = await run({ ...base, out: join(tmp, "shr3"), prevDir: out3, full: true, shrinkMin: 1 });
+    assert.equal(r3.published, true);
   });
 
   await test("check-index detecta credenciales, desalineación, hashes y cadenas de deltas rotas", () => {

@@ -4,6 +4,7 @@
 // nunca credenciales, usuarios, hosts de servidores IPTV ni urls con ellos.
 // --hot: only the daily refresh of the hot categories, even when a full sweep is due (a cheap manual check; it never publishes
 // by itself: like every run, it only writes --out).
+// --force: write it even when nothing changed or when movies or series lost more than MAX_SHRINK of their titles.
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
@@ -612,10 +613,29 @@ export function sweepMode({ prevManifest, nowMs, full = false, hot = false, sour
   return prevManifest.src && source && source !== prevManifest.src ? "full" : "partial";
 }
 
+// A run never publishes an index that lost more than this share of the previous index's movies or of its series: coverage
+// counts the categories the account lists, so an account whose bouquet lacks a whole section (the account is matched on its
+// VOD categories only) or a panel answering empty lists would otherwise wipe that section for every person, through the
+// delta, until the next full sweep. --force publishes it anyway (a real, deliberate cut of the catalog).
+export const MAX_SHRINK = 0.25;
+const SHRINK_MIN_TITLES = 1000; // a previous section smaller than this is too small to judge
+
+// The sections of [entries] that shrank past MAX_SHRINK against [prevEntries]: [{ kind, before, after }].
+export function shrunkKinds(prevEntries, entries, { maxShrink = MAX_SHRINK, minTitles = SHRINK_MIN_TITLES } = {}) {
+  const count = (m, kind) => { let n = 0; for (const e of m.values()) if (e.kind === kind) n++; return n; };
+  const out = [];
+  for (const kind of ["movies", "series"]) {
+    const before = count(prevEntries, kind);
+    const after = count(entries, kind);
+    if (before >= minTitles && after < before * (1 - maxShrink)) out.push({ kind, before, after });
+  }
+  return out;
+}
+
 export async function run(opts) {
   const {
     out = "dist", prevDir = "prev", prevUrl = PREV_URL, iptvMinutes = 150, force = false, full = false, hot = false,
-    fetchFn = fetch, sleep = sleepMs, bootstrapUrl = BOOTSTRAP, minDelay, maxDelay, minFit, maxProbes, verbose = true, now = Date.now,
+    fetchFn = fetch, sleep = sleepMs, bootstrapUrl = BOOTSTRAP, minDelay, maxDelay, minFit, maxProbes, shrinkMin, verbose = true, now = Date.now,
   } = opts;
   const log = makeLog(verbose);
   const t0 = now();
@@ -651,6 +671,12 @@ export async function run(opts) {
   const swept = col.total ? col.ok / col.total : 0;
   log(`categorías leídas ${col.ok}/${col.total} (${(swept * 100).toFixed(1)}%), ${col.entries.size} títulos (${col.isNew.size} nuevos), ${client.requests} peticiones al servicio`);
   if (swept < MIN_COVERAGE) { log(`cobertura < ${MIN_COVERAGE}: no se publica`); return { published: false, reason: "coverage", coverage: swept, requests: client.requests }; }
+  const shrunk = shrunkKinds(prev.entries, col.entries, shrinkMin !== undefined ? { minTitles: shrinkMin } : {});
+  if (shrunk.length) {
+    const what = shrunk.map((s) => `${s.kind === "movies" ? "películas" : "series"} ${s.before} → ${s.after}`).join(", ");
+    if (!force) { log(`${what}: pierde más del ${MAX_SHRINK * 100} %; no se publica (con --force se publica igual)`); return { published: false, reason: "shrink", shrunk, requests: client.requests }; }
+    log(`${what}: pierde más del ${MAX_SHRINK * 100} %, pero se publica (--force)`);
+  }
   // La cobertura publicada es la del último barrido completo: un refresco parcial no la mejora ni la empeora.
   const coverage = mode === "full" ? swept : Number(prev.manifest.coverage) || swept;
   const fullAt = mode === "full" ? new Date(t0).toISOString().replace(/\.\d+Z$/, "Z") : prev.manifest.fullAt;
