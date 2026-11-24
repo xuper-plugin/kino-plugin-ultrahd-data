@@ -10,8 +10,8 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, appendFileS
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { VOD as TABLE_VOD, SERIES as TABLE_SERIES, LIVE as TABLE_LIVE } from "../lib/categoryTable.js";
-import { isAdultName, cleanCategoryName } from "../lib/names.js";
-import { isHidden, normKey } from "../lib/categoryRules.js";
+import { isAdultName, cleanCategoryName, titleCase } from "../lib/names.js";
+import { isHidden, normKey, groupOf, orderOf } from "../lib/categoryRules.js";
 
 export const FORMAT = 1;
 export const PART_LIMIT = 100000; // bytes por trozo sin comprimir: trozos chicos para que un TV lento los parsee y vuelque sin atascarse
@@ -241,16 +241,84 @@ export function panelFit(list, ref) {
   return n / ref.size;
 }
 
+// ---- a panel that is gone ------------------------------------------------------------
+// Panels do disappear: on 2026-11-20 every account of the index's panel left the service's list or started rejecting its
+// login, and no other account carried its categories, so every run stopped and the published index (whose titles can only be
+// opened on that panel) went stale for good. When the previous index's own account is gone (not listed, or its login
+// rejected), no probed account fits the index and enough accounts did answer (so it is not this machine's network), the index
+// moves to the panel with the most Spanish-language categories among those that answered and is rebuilt whole from it. Only
+// at the start of a run: an account lost mid-sweep is still replaced only by one of the same panel.
+
+// Words that mark a Spanish-language VOD category ("CINE | ACCIÓN", "→ VOD ESTRENOS 2026 ←", "ACCIÓN - (LAT)").
+const SPANISH_WORD = /\b(cine|peliculas?|estrenos?|accion|comedia|animacion|aventuras?|ciencia ficcion|suspenso|infantil(es)?|documental(es)?|novelas?|telenovelas|castellano|latino|belic[oa]s?|fantasia|misterio|familiar|vaqueros|clasic[oa]s|navidad|terror|romance|drama)\b/;
+// A panel is taken only with at least this many visible Spanish-language VOD categories...
+export const MIN_SPANISH_CATS = 10;
+// ...and only when at least this many accounts answered with a category list.
+export const MIN_ANSWERS_TO_MOVE = 3;
+
+// How many of [list]'s VOD categories (a get_vod_categories answer) a person would see and are named in Spanish.
+export function spanishScore(list) {
+  let n = 0;
+  for (const c of Array.isArray(list) ? list : []) {
+    const name = String((c && c.category_name) || "");
+    if (!name.trim() || isHidden(name) || isAdultName(name)) continue;
+    if (SPANISH_WORD.test(normKey(cleanCategoryName(name).title))) n++;
+  }
+  return n;
+}
+
+// The category table of a panel the bundled (curated) table does not describe, built from its own list with the plugin's
+// rules (as the plugin's scripts/gen-categories.mjs does): { id: [title, lang, group, order, flags] }.
+export function ownTable(kind, list) {
+  const out = {};
+  (Array.isArray(list) ? list : []).forEach((c, i) => {
+    const id = String((c && c.category_id) || "");
+    const name = String((c && c.category_name) || "").trim();
+    if (!/^\d+$/.test(id) || !name || out[id]) return;
+    const { title, lang } = cleanCategoryName(name);
+    const { group, rank } = groupOf(kind, title);
+    const hide = isHidden(name);
+    const adult = isAdultName(name);
+    const home = !hide && !adult && lang === "es-419" &&
+      ((kind === "vod" && ((group === "estrenos" && rank <= 1) || (group === "generos" && rank < 5))) || (kind === "series" && group === "plataformas" && rank < 4));
+    out[id] = [titleCase(title), lang, group, orderOf(kind, group, rank, i), `${hide ? "h" : ""}${adult ? "a" : ""}${home ? "H" : ""}`];
+  });
+  return out;
+}
+
+// Whether the bundled table describes [list]'s panel: of its categories whose id the table knows, at least half carry the
+// table's name (another panel's ids, when they collide, name other things).
+export function fitsBundledTable(list) {
+  let known = 0;
+  let same = 0;
+  for (const c of Array.isArray(list) ? list : []) {
+    const e = TABLE_VOD[String((c && c.category_id) || "")];
+    if (!e) continue;
+    known++;
+    if (catTitle(c.category_name) === normKey(e[0])) same++;
+  }
+  return same > 0 && same >= known / 2;
+}
+
+// The category tables of an index made from [vodList]'s panel: the bundled ones for the panel they describe, else its own
+// (its series table is built by collect() from the series list it already asks for: no extra request).
+export function tablesFor(vodList) {
+  return fitsBundledTable(vodList) ? { vod: TABLE_VOD, series: TABLE_SERIES, own: false } : { vod: ownTable("vod", vodList), series: null, own: true };
+}
+
 // A "polite" connection to one account of the index's panel: one request at a time, a pause between categories, backoff on
 // errors. start() probes the list (the previous index's account first) and takes the account that best fits [ref], stopping
 // at the first that carries all of it. It never leaves the panel mid-sweep: an account that rejects its login is replaced at
 // once, one that stops answering after FAILS_TO_SWITCH straight failures too, and the replacement is always another account
 // that fits [ref]. A category request only goes to an account that lists that category under the same name, so a
-// replacement never answers for ids it does not have. With no account of the panel left it throws an error with `fatal`.
-export function makeClient({ servers, ref = new Map(), preferTag = "", fetchFn = fetch, sleep = sleepMs, minDelay = 3000, maxDelay = 5000, maxProbes = MAX_PROBES, minFit = MIN_ACCOUNT_FIT, probeTimeoutMs = PROBE_TIMEOUT_MS, log = () => {}, rand = Math.random }) {
+// replacement never answers for ids it does not have. With no account of the panel left it throws an error with `fatal`,
+// except in start() when the panel is gone (see "a panel that is gone"): then it moves to another panel and `moved` is true.
+export function makeClient({ servers, ref: ref0 = new Map(), preferTag = "", allowMove = true, minSpanish = MIN_SPANISH_CATS, minAnswers = MIN_ANSWERS_TO_MOVE, fetchFn = fetch, sleep = sleepMs, minDelay = 3000, maxDelay = 5000, maxProbes = MAX_PROBES, minFit = MIN_ACCOUNT_FIT, probeTimeoutMs = PROBE_TIMEOUT_MS, log = () => {}, rand = Math.random }) {
   const preferred = servers.filter((s) => preferTag && sourceTag(s.base) === preferTag);
   const accounts = [...preferred, ...servers.filter((s) => !preferred.includes(s))].slice(0, maxProbes)
     .map((s, i) => ({ ...s, n: i + 1, tag: sourceTag(s.base), state: "new", fit: 0, lists: {} }));
+  let ref = ref0;
+  let moved = false;
   let active = null;
   let consecutive = 0;
   let requests = 0;
@@ -299,8 +367,36 @@ export function makeClient({ servers, ref = new Map(), preferTag = "", fetchFn =
     return accounts.filter((a) => a.state === "panel").sort((a, b) => b.fit - a.fit || a.n - b.n)[0] || null;
   }
 
+  // The previous index's panel is gone: its own account is not listed or rejects its login, no probed account fits it, and
+  // enough accounts answered. Then the answering account with the most Spanish-language categories becomes the panel.
+  function movePanel() {
+    if (!allowMove || active || !ref.size) return null;
+    const own = accounts.filter((a) => a.tag === preferTag);
+    if (own.length && !own.every((a) => a.state === "dead")) return null;
+    const answered = accounts.filter((a) => a.state === "other" && Array.isArray(a.lists.vod));
+    if (answered.length < minAnswers) return null;
+    const best = answered.map((a) => ({ a, score: spanishScore(a.lists.vod), size: a.lists.vod.length }))
+      .filter((x) => x.score >= minSpanish).sort((x, y) => y.score - x.score || y.size - x.size || x.a.n - y.a.n)[0];
+    if (!best) return null;
+    const next = new Map();
+    for (const c of best.a.lists.vod) {
+      const id = String(c.category_id || "");
+      const name = String(c.category_name || "").trim();
+      if (/^\d+$/.test(id) && name && !isHidden(name) && !isAdultName(name)) next.set(id, cleanCategoryName(name).title);
+    }
+    log(`el panel del índice ya no está (${answered.length} cuentas respondieron, ninguna lo lleva): se cambia al de la ${label(best.a)}, con ${best.score} categorías en español`);
+    ref = next;
+    moved = true;
+    for (const a of accounts) {
+      if (a.state !== "other" || !Array.isArray(a.lists.vod)) continue;
+      a.fit = panelFit(a.lists.vod, ref);
+      if (a.fit >= minFit) a.state = "panel";
+    }
+    return best.a;
+  }
+
   async function select() {
-    const next = await choose();
+    const next = (await choose()) || movePanel();
     if (!next) {
       const e = new Error(`ninguna cuenta del panel del índice responde (${accounts.filter((a) => a.state !== "new").length} probadas; no se cambia de panel)`);
       e.fatal = true;
@@ -380,14 +476,16 @@ export function makeClient({ servers, ref = new Map(), preferTag = "", fetchFn =
     // The tag the index is stamped with: the account in use at the end, the last one known to answer (every account that
     // answered is of the index's panel, so the ids are the same on all of them).
     get source() { return active ? active.tag : ""; },
+    // Whether start() left the previous index's panel (it was gone): the index is then rebuilt whole from the new one.
+    get moved() { return moved; },
   };
 }
 
 // ---- categorías -----------------------------------------------------------------
 
 // Categorías visibles (ni ocultas ni adultas), según la tabla curada y, si la categoría no está, las reglas automáticas.
-export function visibleCategories(kind, list) {
-  const table = kind === "vod" ? TABLE_VOD : TABLE_SERIES;
+// [table]: the panel's category table (the bundled one by default).
+export function visibleCategories(kind, list, table = kind === "vod" ? TABLE_VOD : TABLE_SERIES) {
   const out = [];
   for (const c of Array.isArray(list) ? list : []) {
     const id = String(c.category_id || "");
@@ -448,7 +546,7 @@ function addItems(entries, prev, kind, items, catId, isNew) {
 
 // mode "full": recorre todas las categorías visibles. mode "partial": solo las calientes, sobre una copia del índice anterior
 // (detecta altas y bajas dentro de ellas). Devuelve { entries, ok, failed, total, isNew, mode }.
-export async function collect({ client, prev, log, deadline, now = Date.now, mode = "full", year = new Date(now()).getUTCFullYear() }) {
+export async function collect({ client, prev, log, deadline, now = Date.now, mode = "full", tables = null, year = new Date(now()).getUTCFullYear() }) {
   const partial = mode === "partial";
   const entries = new Map();
   if (partial) for (const [k, e] of prev.entries) entries.set(k, cloneEntry(e));
@@ -456,7 +554,9 @@ export async function collect({ client, prev, log, deadline, now = Date.now, mod
   const status = { ok: 0, failed: [], total: 0, skipped: 0 };
   const failedByKind = { movies: new Set(), series: new Set() };
   for (const [kind, label, itemsAction] of [["movies", "vod", "get_vod_streams"], ["series", "series", "get_series"]]) {
-    let cats = visibleCategories(label, await client.categories(label));
+    const list = await client.categories(label);
+    if (tables && !tables[label]) tables[label] = ownTable(label, list);
+    let cats = visibleCategories(label, list, tables ? tables[label] : undefined);
     const visible = cats.length;
     if (partial) cats = cats.filter((c) => isHotCategory(label, c.name, year));
     status.total += cats.length;
@@ -589,8 +689,8 @@ export function buildRevision({ entries, prev, coverage, generated, fullAt, cate
   return { changed: true, files, manifest };
 }
 
-export function categoriesJson() {
-  return JSON.stringify({ v: FORMAT, vod: TABLE_VOD, series: TABLE_SERIES, live: TABLE_LIVE });
+export function categoriesJson(tables = { vod: TABLE_VOD, series: TABLE_SERIES }) {
+  return JSON.stringify({ v: FORMAT, vod: tables.vod || {}, series: tables.series || {}, live: TABLE_LIVE });
 }
 
 // ---- ejecución completa ---------------------------------------------------------
@@ -635,7 +735,7 @@ export function shrunkKinds(prevEntries, entries, { maxShrink = MAX_SHRINK, minT
 export async function run(opts) {
   const {
     out = "dist", prevDir = "prev", prevUrl = PREV_URL, iptvMinutes = 150, force = false, full = false, hot = false,
-    fetchFn = fetch, sleep = sleepMs, bootstrapUrl = BOOTSTRAP, minDelay, maxDelay, minFit, maxProbes, shrinkMin, verbose = true, now = Date.now,
+    fetchFn = fetch, sleep = sleepMs, bootstrapUrl = BOOTSTRAP, minDelay, maxDelay, minFit, maxProbes, minSpanish, minAnswers, shrinkMin, verbose = true, now = Date.now,
   } = opts;
   const log = makeLog(verbose);
   const t0 = now();
@@ -656,22 +756,33 @@ export async function run(opts) {
   const client = makeClient({
     servers, ref, preferTag: prevSrc, fetchFn, sleep, minDelay, maxDelay, log,
     ...(minFit !== undefined ? { minFit } : {}), ...(maxProbes ? { maxProbes } : {}),
+    ...(minSpanish !== undefined ? { minSpanish } : {}), ...(minAnswers !== undefined ? { minAnswers } : {}),
   });
-  // Never another panel: without an account of the index's panel the run stops here and the old index stays published.
+  // Never another panel while the index's own one is alive: without an account of it the run stops here and the old index
+  // stays published. Only a panel that is gone is left (client.moved).
   const stop = (e) => {
     log(`${String((e && e.message) || e).slice(0, 160)}: no se publica; el índice anterior sigue publicado`);
     return { published: false, reason: e && e.fatal ? "no-account" : "service", requests: client.requests };
   };
   try { await client.start(); } catch (e) { if (!e.fatal) throw e; return stop(e); }
   const moved = !!prevSrc && client.source !== prevSrc;
-  const mode = sweepMode({ prevManifest: prev.manifest, nowMs: t0, full, hot, source: client.source });
-  log(`modo: ${mode === "full" ? "barrido completo" : "refresco de categorías calientes"}${moved ? " (la cuenta no es la del índice anterior)" : ""}`);
+  // A new panel: its ids are not the old index's, so nothing of it carries over (titles, kept categories, a delta); the index
+  // is swept whole and published as a fresh snapshot with the panel's own category table.
+  const newPanel = client.moved;
+  const base = newPanel ? { ...prev, entries: new Map() } : prev;
+  const mode = newPanel ? "full" : sweepMode({ prevManifest: prev.manifest, nowMs: t0, full, hot, source: client.source });
+  log(`modo: ${mode === "full" ? "barrido completo" : "refresco de categorías calientes"}${newPanel ? " (panel nuevo: el índice se rehace entero)" : moved ? " (la cuenta no es la del índice anterior)" : ""}`);
   let col;
-  try { col = await collect({ client, prev, log, deadline: t0 + iptvMinutes * 60000, now, mode }); } catch (e) { return stop(e); }
+  let tables;
+  try {
+    tables = tablesFor(await client.categories("vod"));
+    if (tables.own) log("el panel no es el de la tabla de categorías incluida: se usa su propia tabla");
+    col = await collect({ client, prev: base, log, deadline: t0 + iptvMinutes * 60000, now, mode, tables });
+  } catch (e) { return stop(e); }
   const swept = col.total ? col.ok / col.total : 0;
   log(`categorías leídas ${col.ok}/${col.total} (${(swept * 100).toFixed(1)}%), ${col.entries.size} títulos (${col.isNew.size} nuevos), ${client.requests} peticiones al servicio`);
   if (swept < MIN_COVERAGE) { log(`cobertura < ${MIN_COVERAGE}: no se publica`); return { published: false, reason: "coverage", coverage: swept, requests: client.requests }; }
-  const shrunk = shrunkKinds(prev.entries, col.entries, shrinkMin !== undefined ? { minTitles: shrinkMin } : {});
+  const shrunk = shrunkKinds(base.entries, col.entries, shrinkMin !== undefined ? { minTitles: shrinkMin } : {});
   if (shrunk.length) {
     const what = shrunk.map((s) => `${s.kind === "movies" ? "películas" : "series"} ${s.before} → ${s.after}`).join(", ");
     if (!force) { log(`${what}: pierde más del ${MAX_SHRINK * 100} %; no se publica (con --force se publica igual)`); return { published: false, reason: "shrink", shrunk, requests: client.requests }; }
@@ -682,7 +793,7 @@ export async function run(opts) {
   const fullAt = mode === "full" ? new Date(t0).toISOString().replace(/\.\d+Z$/, "Z") : prev.manifest.fullAt;
 
   const generated = new Date(now()).toISOString().replace(/\.\d+Z$/, "Z");
-  const o = buildRevision({ entries: col.entries, prev, coverage, generated, fullAt, categoriesJson: categoriesJson(), source: client.source });
+  const o = buildRevision({ entries: col.entries, prev: base, coverage, generated, fullAt, categoriesJson: categoriesJson(tables), source: client.source });
   if (!o.changed && !force) { log("sin cambios respecto al índice anterior: no se publica"); return { published: false, reason: "unchanged", manifest: o.manifest }; }
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });

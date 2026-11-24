@@ -4,7 +4,7 @@ import http from "node:http";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, cpSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cleanTitle, findKey, idOf, run, fullSweepDue, isHotCategory, revisionOf, DELTAS_KEPT, panelFit, panelReference, sweepMode, sourceTag } from "./gen-index.mjs";
+import { cleanTitle, findKey, idOf, run, fullSweepDue, isHotCategory, revisionOf, DELTAS_KEPT, panelFit, panelReference, sweepMode, sourceTag, spanishScore, fitsBundledTable, ownTable, tablesFor } from "./gen-index.mjs";
 import { checkIndex } from "./check-index.mjs";
 
 let passed = 0;
@@ -395,6 +395,82 @@ try {
     // The same run with the account's series: nothing shrank, it publishes without --force.
     const r3 = await run({ ...base, out: join(tmp, "shr3"), prevDir: out3, full: true, shrinkMin: 1 });
     assert.equal(r3.published, true);
+  });
+
+  // A Spanish-language panel with its own numbering (as the service's panels looked on 2026-11-24) and a smaller one.
+  const NEW_VOD = ["ESTRENOS 2026", "ACCIÓN", "COMEDIA", "TERROR", "DRAMA", "ANIMACIÓN", "AVENTURAS", "CIENCIA FICCIÓN", "SUSPENSO", "INFANTIL", "DOCUMENTAL", "ESTRENOS CAM"]
+    .map((n, i) => ({ category_id: String(30 + i), category_name: "CINE | " + n }));
+  const NEW_SERIES = [{ category_id: "97", category_name: "SERIES ¦ NETFLIX" }];
+  ACCOUNTS.NEWP = { pass: "P7", vod: NEW_VOD, series: NEW_SERIES };
+  ACCOUNTS.NEWP2 = { pass: "P8", vod: NEW_VOD, series: NEW_SERIES };
+  ACCOUNTS.SMALLES = { pass: "P9", vod: NEW_VOD.slice(0, 4).map((c) => ({ ...c, category_id: "5" + c.category_id })), series: [] };
+  const newData = () => {
+    data.vod[30] = [{ name: "Estreno del panel nuevo (2026)", year: "2026" }];
+    data.vod[31] = [{ name: "Spider-Man: Sin camino a casa (2021)", year: "2021" }, { name: "Acción Nueva (2024)", year: "2024" }];
+    data.series[97] = [{ name: "Serie Nueva (2025)", year: "2025" }];
+  };
+
+  await test("reglas del cambio de panel: categorías en español, tabla incluida, tabla propia", () => {
+    assert.equal(spanishScore(NEW_VOD), 11, "la CAM no cuenta");
+    assert.equal(spanishScore(OTHER_VOD), 0);
+    assert.equal(spanishScore([{ category_id: "1", category_name: "→ VOD ESTRENOS 2026 ←" }, { category_id: "2", category_name: "FILM IN SALA" }, { category_id: "3", category_name: "EROS +18 COMEDIA" }]), 1);
+    assert.equal(fitsBundledTable(CATS_VOD), true);
+    assert.equal(fitsBundledTable(NEW_VOD), false, "ids que la tabla no conoce");
+    assert.equal(fitsBundledTable(OTHER_VOD), false, "mismos ids, otros nombres");
+    const t = ownTable("vod", NEW_VOD);
+    assert.deepEqual(t["31"].slice(0, 3), ["Cine | Acción", "es-419", "generos"]);
+    assert.equal(t["41"][4], "h", "la CAM queda oculta");
+    assert.equal(tablesFor(CATS_VOD).own, false);
+    assert.equal(tablesFor(NEW_VOD).own, true);
+  });
+
+  await test("panel que ya no está (su cuenta rechaza el login, ninguna lo lleva): se cambia al panel en español y se rehace entero", async () => {
+    newData();
+    state.lines = accountsOf([[iptv, "AUTH0"], [iptv3, "OTHER"], [iptv3, "SMALLES"], [iptv2, "NEWP"]]);
+    const mark = state.who.length;
+    const r = await run({ ...base, out: join(tmp, "mv1"), prevDir: out3 });
+    state.lines = null;
+    const who = state.who.slice(mark);
+    assert.equal(r.published, true, JSON.stringify(r));
+    assert.equal(r.mode, "full");
+    assert.equal(r.manifest.src, tagOf(iptv2));
+    assert.deepEqual(r.manifest.deltas, [], "otro panel: snapshot nuevo, sin delta contra el viejo");
+    assert.deepEqual(titlesOf(join(tmp, "mv1")).sort(), ["Acción Nueva", "Estreno del panel nuevo", "Serie Nueva", "Spider-Man: Sin camino a casa"]);
+    const cats = json(join(tmp, "mv1"), "categories.json");
+    assert.deepEqual(cats.vod["31"].slice(0, 2), ["Cine | Acción", "es-419"], "la tabla del panel nuevo");
+    assert.ok(!cats.vod["1147"], "nada de la tabla del panel viejo");
+    assert.deepEqual(cats.series["97"].slice(0, 3), ["Series ¦ Netflix", "es-419", "plataformas"]);
+    assert.ok(!who.some((w) => /^(OTHER|SMALLES):get_(vod_streams|series):/.test(w)), "a los otros paneles solo la prueba");
+    assert.ok(!who.includes("NEWP:get_vod_streams:41"), "la CAM no se pide");
+    assert.deepEqual(checkIndex(join(tmp, "mv1")), []);
+
+    // The next day the new panel is the index's panel: a normal partial refresh on it, nothing changed, nothing published.
+    const mark2 = state.who.length;
+    state.lines = accountsOf([[iptv2, "NEWP"], [iptv3, "OTHER"]]);
+    const r2 = await run({ ...base, out: join(tmp, "mv2"), prevDir: join(tmp, "mv1") });
+    state.lines = null;
+    assert.equal(r2.reason, "unchanged", JSON.stringify(r2));
+    assert.deepEqual(state.who.slice(mark2).filter((w) => w.startsWith("OTHER:")), [], "la primera cuenta ya es del panel");
+  });
+
+  await test("no se cambia de panel si la cuenta del índice solo no responde, o si respondieron muy pocas", async () => {
+    newData();
+    ACCOUNTS.U1.served = 0;
+    ACCOUNTS.U1.downAfter = 0; // the index's own account does not answer: maybe a blip, not a gone panel
+    state.lines = accountsOf([[iptv, "U1"], [iptv3, "OTHER"], [iptv3, "SMALLES"], [iptv2, "NEWP"]]);
+    const r = await run({ ...base, out: join(tmp, "mv3"), prevDir: out3 });
+    delete ACCOUNTS.U1.downAfter;
+    assert.equal(r.reason, "no-account");
+    assert.ok(!existsSync(join(tmp, "mv3")));
+    // Its login is rejected, but only two accounts answered (fewer than MIN_ANSWERS_TO_MOVE).
+    state.lines = accountsOf([[iptv, "AUTH0"], [iptv3, "OTHER"], [iptv2, "NEWP"]]);
+    const r2 = await run({ ...base, out: join(tmp, "mv4"), prevDir: out3 });
+    assert.equal(r2.reason, "no-account");
+    // Enough answers, but no panel with enough Spanish-language categories.
+    const r3 = await run({ ...base, out: join(tmp, "mv5"), prevDir: out3, minAnswers: 2, minSpanish: 20 });
+    state.lines = null;
+    assert.equal(r3.reason, "no-account");
+    assert.ok(!existsSync(join(tmp, "mv4")) && !existsSync(join(tmp, "mv5")));
   });
 
   await test("check-index detecta credenciales, desalineación, hashes y cadenas de deltas rotas", () => {
