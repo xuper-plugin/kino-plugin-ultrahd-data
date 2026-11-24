@@ -40,4 +40,14 @@ Para sincronizar las reglas con el plugin: `node scripts/sync-lib.mjs <carpeta d
 
 ## Workflow
 
-`.github/workflows/index.yml` corre a diario (07:17 UTC) y a mano (`force`, `full`). No necesita secretos. Publica con un solo commit huérfano en la rama `data` (autor `xuper-plugin`), sobrescrito con `--force`.
+Desde el 2026-11-24 la corrida diaria no está en GitHub Actions: corre en el servidor `famili` de la red local, con conexión residencial. El timer de systemd `ultrahd-index.timer` (07:17 UTC, `Persistent=true`) lanza `ultrahd-index.service`, que ejecuta `/home/familia/ultrahd-index/run.sh` como `familia`. Ese script repite paso a paso lo que hacía el workflow: actualiza el clon `/home/familia/ultrahd-index/repo` a `main`, corre `scripts/test.mjs`, baja la rama `data` como índice anterior, genera, verifica con `check-index.mjs` y, si algo cambió, publica un solo commit huérfano en la rama `data` (autor `xuper-plugin`), sobrescrito con `--force`. Sale con 3 (o 2) si `gen-index.mjs` no publicó, y con 0 si no hubo cambios.
+
+A mano en `famili`:
+
+```bash
+sudo systemctl start ultrahd-index.service       # corrida normal
+journalctl -u ultrahd-index -n 80                # ver el resultado
+~/ultrahd-index/run.sh --full                    # como familia: barrido completo (también --force)
+```
+
+`.github/workflows/index.yml` sigue para correrlo a mano desde GitHub (`force`, `full`), sin horario. No necesita secretos.

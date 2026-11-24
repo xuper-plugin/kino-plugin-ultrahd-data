@@ -1,8 +1,7 @@
 name: Índice de títulos
 
+# La corrida diaria (07:17 UTC) se movió a famili el 2026-11-24 (timer ultrahd-index); aquí queda solo a mano.
 on:
-  schedule:
-    - cron: "17 7 * * *"
   workflow_dispatch:
     inputs:
       force:
